@@ -1,263 +1,179 @@
 import os
 import pickle
-from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
 import pandas as pd
 import time
 import random
-from datetime import datetime
-from urllib.parse import urljoin
-import logging
-from typing import Optional, Dict, List, Tuple, Any
+from urllib3.exceptions import MaxRetryError
+from requests.exceptions import SSLError
+import ssl
 
-# تنظیمات پایه
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# تنظیمات SSL
+ssl._create_default_https_context = ssl._create_unverified_context
 
-# تنظیمات اسکراپر
-class Config:
-    OUTPUT_PATH = "jobvision_data.xlsx"
-    STATE_FILE = "scraper_state.pkl"
-    MAX_RECORDS = 1200
-    PAGES_PER_BROWSER = 20
-    DELAYS = {
-        'page_load': (3, 7),         # تأخیر بارگذاری صفحه
-        'between_jobs': (2, 5),     # تأخیر بین پردازش مشاغل
-        'between_pages': (5, 12),   # تأخیر بین صفحات
-        'new_browser': (10, 20)     # تأخیر برای مرورگر جدید
+# مسیرهای فایل
+output_path = "C:/Users/Asus/Documents/jobvision_data.xlsx"
+state_file = "scraper_state.pkl"
+
+# تنظیمات مرورگر برای حل مشکل SSL
+chrome_options = Options()
+chrome_options.add_argument("--disable-gpu")
+chrome_options.add_argument("--no-sandbox")
+chrome_options.add_argument("--ignore-certificate-errors")
+chrome_options.add_argument("--allow-insecure-localhost")
+chrome_options.add_argument("--disable-web-security")
+chrome_options.add_argument("--disable-dev-shm-usage")
+chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+
+# ایجاد دایرکتوری اگر وجود نداشته باشد
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+def init_driver():
+    service = Service("C:/Users/ASUS/Desktop/chromedriver-win64/chromedriver.exe")
+    return webdriver.Chrome(service=service, options=chrome_options)
+
+def load_state():
+    if os.path.exists(state_file):
+        with open(state_file, 'rb') as f:
+            return pickle.load(f)
+    return {
+        'current_page': 1,
+        'processed_urls': set(),
+        'saved_records': 0
     }
-    USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.199 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.199 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:102.0) Gecko/20100101 Firefox/102.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7; rv:102.0) Gecko/20100101 Firefox/102.0",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.199 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101 Firefox/102.0"
-    ]
 
-class JobVisionScraper:
-    def __init__(self):
-        self.browser: Optional[Browser] = None
-        self.context: Optional[BrowserContext] = None
-        self.page: Optional[Page] = None
-        self.pages_scraped_in_session: int = 0
-        self.init_files()
-        self.state = self.load_state()
+def save_state(state):
+    with open(state_file, 'wb') as f:
+        pickle.dump(state, f)
 
-    def init_files(self) -> None:
-        """آماده‌سازی فایل‌های خروجی"""
-        if not os.path.exists(Config.OUTPUT_PATH):
-            pd.DataFrame(columns=[
-                "job_title", "company", "location", "salary", "status",
-                "job_link", "page", "extraction_date", "description"
-            ]).to_excel(Config.OUTPUT_PATH, index=False)
+def init_excel():
+    if not os.path.exists(output_path):
+        pd.DataFrame(columns=[
+            "عنوان شغل", "شرکت", "محل کار", "حقوق", "وضعیت",
+            "لینک شغل", "صفحه", "تاریخ استخراج"
+        ]).to_excel(output_path, index=False, engine='openpyxl')
 
-    def load_state(self) -> Dict[str, Any]:
-        """بارگذاری وضعیت قبلی"""
-        if os.path.exists(Config.STATE_FILE):
-            try:
-                with open(Config.STATE_FILE, 'rb') as f:
-                    return pickle.load(f)
-            except Exception as e:
-                logging.error(f"Error loading state: {e}")
-        return {'current_page': 1, 'saved_records': 0}
-
-    def save_state(self) -> None:
-        """ذخیره وضعیت فعلی"""
+def save_to_excel(new_data):
+    try:
+        # خواندن داده‌های موجود
         try:
-            with open(Config.STATE_FILE, 'wb') as f:
-                pickle.dump(self.state, f)
-        except Exception as e:
-            logging.error(f"Error saving state: {e}")
+            existing_data = pd.read_excel(output_path, engine='openpyxl')
+        except:
+            existing_data = pd.DataFrame()
 
-    def random_delay(self, delay_type: str) -> float:
-        """تاخیر تصادفی بر اساس نوع"""
-        min_d, max_d = Config.DELAYS[delay_type]
-        delay = random.uniform(min_d, max_d)
-        time.sleep(delay)
-        return delay
+        # اضافه کردن داده‌های جدید
+        updated_data = pd.concat([existing_data, pd.DataFrame(new_data)], ignore_index=True)
+        
+        # ذخیره فایل
+        updated_data.to_excel(output_path, index=False, engine='openpyxl')
+        print(f"ذخیره شد. کل رکوردها: {len(updated_data)}")
+        return len(updated_data)
+    except Exception as e:
+        print(f"خطا در ذخیره فایل: {str(e)}")
+        return 0
 
-    def init_browser(self) -> None:
-        """آماده‌سازی مرورگر جدید"""
-        self.close_browser()
+def random_delay(min=2, max=5):
+    time.sleep(random.uniform(min, max))
+
+def safe_extract(element, selector, attribute=None, default="N/A"):
+    try:
+        elem = element.find_element(By.CSS_SELECTOR, selector)
+        if attribute:
+            return elem.get_attribute(attribute) or default
+        return elem.text or default
+    except NoSuchElementException:
+        return default
+
+def extract_job_data(job_element, page_num):
+    try:
+        # استخراج لینک با بررسی کامل
+        href = safe_extract(job_element, 'a[class*="mobile-job-card"]', 'href')
+        if href != "N/A":
+            job_link = f"https://jobvision.ir{href.split('?')[0]}"
+        else:
+            job_link = "N/A"
+
+        # استخراج حقوق
+        salary = safe_extract(job_element, 'span.font-size-12px:not(.text-secondary)')
+        if salary == "N/A":
+            salary_div = safe_extract(job_element, 'div.d-flex.flex-wrap')
+            if 'میلیون' in salary_div or 'تومان' in salary_div:
+                salary = salary_div.split('|')[-1].strip()
+
+        return {
+            "عنوان شغل": safe_extract(job_element, '.job-card-title'),
+            "شرکت": safe_extract(job_element, 'a.text-black.line-height-24'),
+            "محل کار": safe_extract(job_element, 'span.text-secondary.pointer-events-none'),
+            "حقوق": salary if salary != "N/A" else "توافقی",
+            "وضعیت": "فوری" if safe_extract(job_element, '.urgent-tag') != "N/A" else "معمولی",
+            "لینک شغل": job_link,
+            "صفحه": page_num,
+            "تاریخ استخراج": pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+    except Exception as e:
+        print(f"خطا در استخراج داده: {str(e)}")
+        return None
+
+def scrape_page(driver, page_num, state):
+    try:
+        url = f"https://jobvision.ir/jobs?page={page_num}&sort=0"
+        print(f"در حال پردازش صفحه {page_num} - {url}")
         
-        # انتخاب User-Agent جدید
-        current_user_agent = random.choice(Config.USER_AGENTS)
-        logging.info(f"استفاده از User-Agent: {current_user_agent}")
-        
-        playwright = sync_playwright().start()
-        self.browser = playwright.chromium.launch(
-            headless=False,
-            args=[
-                "--disable-gpu",
-                "--disable-extensions",
-                "--disable-blink-features=AutomationControlled",
-                "--start-maximized"
-            ]
+        driver.get(url)
+        WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, 'job-card'))
         )
-        self.context = self.browser.new_context(
-            user_agent=current_user_agent,
-            viewport={'width': 1920, 'height': 1080},
-            java_script_enabled=True,
-            bypass_csp=True
-        )
-        self.context.route("**/*", lambda route, request: route.abort() if request.resource_type == "image" else route.continue_())
+        random_delay(3, 7)
         
-        self.page = self.context.new_page()  # مقداردهی صفحه جدید
-        self.pages_scraped_in_session = 0
-        logging.info("مرورگر جدید راه‌اندازی شد")
-
-    def close_browser(self) -> None:
-        """بستن مرورگر فعلی"""
-        if self.context:
-            self.context.close()
-        if self.browser:
-            self.browser.close()  # تغییر از stop به close
-        self.browser = None
-        self.context = None
-        self.page = None
-        logging.info("مرورگر فعلی بسته شد")
-
-    def scrape_page(self, page_num: int) -> bool:
-        """استخراج داده‌های یک صفحه"""
-        try:
-            if not self.page or self.pages_scraped_in_session >= Config.PAGES_PER_BROWSER:
-                self.init_browser()
-                if not self.page:
-                    raise RuntimeError("Page initialization failed")
-
-            url = f"https://jobvision.ir/jobs?page={page_num}&sort=0"
-            logging.info(f"در حال پردازش صفحه {page_num} - {url}")
-            
-            # تأخیر تصادفی قبل از بارگذاری صفحه
-            delay = self.random_delay('page_load')
-            logging.debug(f"تاخیر {delay:.1f} ثانیه قبل از بارگذاری صفحه")
-            
-            self.page.goto(url, timeout=30000)  # type: ignore
-            self.page.wait_for_selector('job-card', state='attached', timeout=15000)  # type: ignore
-            
-            # اسکرول به پایین صفحه با تأخیر تصادفی
-            self.page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
-            delay = self.random_delay('between_jobs')
-            logging.debug(f"تاخیر {delay:.1f} ثانیه پس از اسکرول")
-            
-            # تأخیر تصادفی پس از بارگذاری صفحه
-            delay = self.random_delay('page_load')
-            logging.debug(f"تاخیر {delay:.1f} ثانیه پس از بارگذاری صفحه")
-            
-            job_cards = self.page.query_selector_all('job-card.col-12.row.cursor.px-0.ng-star-inserted')  # type: ignore
-            if not job_cards:
-                logging.warning(f"صفحه {page_num} خالی است")
-                return False
-            
-            batch_data = []
-            for job in job_cards:
-                # تأخیر تصادفی بین پردازش هر شغل
-                delay = self.random_delay('between_jobs')
-                logging.debug(f"تاخیر {delay:.1f} ثانیه بین پردازش مشاغل")
-                
-                job_data = self.extract_job_data(job, page_num)
-                if job_data:
-                    batch_data.append(job_data)
-            
-            if batch_data:
-                self.save_data(batch_data)
-                self.state['current_page'] = page_num + 1
-                self.state['saved_records'] += len(batch_data)
-                self.save_state()
-                self.pages_scraped_in_session += 1
-            
-            # تأخیر تصادفی پس از پردازش صفحه
-            delay = self.random_delay('between_pages')
-            logging.debug(f"تاخیر {delay:.1f} ثانیه پس از پردازش صفحه")
-            
-            return True
-            
-        except Exception as e:
-            logging.error(f"خطا در پردازش صفحه {page_num}: {str(e)}")
+        job_cards = driver.find_elements(By.CSS_SELECTOR, 'job-card.col-12.row.cursor.px-0.ng-star-inserted')
+        if not job_cards:
+            print("صفحه خالی است - احتمالاً پایان نتایج")
             return False
+        
+        batch_data = []
+        for job in job_cards:
+            job_data = extract_job_data(job, page_num)
+            if job_data:
+                batch_data.append(job_data)
+        
+        if batch_data:
+            state['saved_records'] = save_to_excel(batch_data)
+            state['current_page'] = page_num + 1
+            save_state(state)
+        
+        return True
+    except Exception as e:
+        print(f"خطا در پردازش صفحه {page_num}: {str(e)}")
+        return False
 
-    def extract_job_data(self, job_element: Any, page_num: int) -> Optional[Dict[str, Any]]:
-        """استخراج داده‌های یک شغل"""
-        try:
-            href = job_element.get_attribute('href')
-            job_link = urljoin("https://jobvision.ir", href.split('?')[0]) if href else "N/A"
+def main():
+    init_excel()
+    state = load_state()
+    driver = init_driver()
+    
+    try:
+        while state['saved_records'] < 1200:  # حد نصاب رکوردها
+            success = scrape_page(driver, state['current_page'], state)
+            if not success:
+                break
             
-            title_element = job_element.query_selector('.job-card-title')
-            title = title_element.inner_text().strip() if title_element else "N/A"
+            random_delay(5, 10)  # تاخیر بین صفحات
             
-            company_element = job_element.query_selector('a.text-black.line-height-24')
-            company = company_element.inner_text().strip() if company_element else "N/A"
-            
-            location_element = job_element.query_selector('span.text-secondary.pointer-events-none')
-            location = location_element.inner_text().strip() if location_element else "N/A"
-            
-            salary_element = job_element.query_selector('span.font-size-12px:not(.text-secondary)')
-            salary = salary_element.inner_text().strip() if salary_element else "N/A"
-            
-            if salary == "N/A":
-                salary_div = job_element.query_selector('div.d-flex.flex-wrap')
-                if salary_div:
-                    salary_text = salary_div.inner_text()
-                    if 'میلیون' in salary_text or 'تومان' in salary_text:
-                        salary = salary_text.split('|')[-1].strip()
-            
-            status = "Urgent" if job_element.query_selector('.urgent-tag') else "Normal"
-            
-            return {
-                "job_title": title,
-                "company": company,
-                "location": location,
-                "salary": salary if salary != "N/A" else "Negotiable",
-                "status": status,
-                "job_link": job_link,
-                "page": page_num,
-                "extraction_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            }
-        except Exception as e:
-            logging.error(f"خطا در استخراج شغل: {str(e)}")
-            return None
-
-    def save_data(self, new_data: List[Dict[str, Any]]) -> None:
-        """ذخیره داده‌ها در فایل"""
-        try:
-            existing_data = pd.read_excel(Config.OUTPUT_PATH) if os.path.exists(Config.OUTPUT_PATH) else pd.DataFrame()
-            updated_data = pd.concat([existing_data, pd.DataFrame(new_data)], ignore_index=True)
-            updated_data.to_excel(Config.OUTPUT_PATH, index=False)
-            logging.info(f"داده‌ها ذخیره شدند. کل رکوردها: {len(updated_data)}")
-        except Exception as e:
-            logging.error(f"خطا در ذخیره داده‌ها: {str(e)}")
-
-    def run(self) -> None:
-        """اجرای اصلی اسکراپر"""
-        try:
-            self.init_browser()
-            
-            while self.state['saved_records'] < Config.MAX_RECORDS:
-                success = self.scrape_page(self.state['current_page'])
-                if not success:
-                    break
-                
-                delay = self.random_delay('between_pages')
-                logging.info(f"تاخیر {delay:.1f} ثانیه قبل از صفحه بعد...")
-
-                # بررسی تعداد صفحات پردازش شده و باز کردن مرورگر جدید با User-Agent جدید
-                if self.pages_scraped_in_session >= Config.PAGES_PER_BROWSER:
-                    self.close_browser()
-                    delay = self.random_delay('new_browser')
-                    logging.info(f"تغییر مرورگر و User-Agent پس از {Config.PAGES_PER_BROWSER} صفحه - تاخیر {delay:.1f} ثانیه")
-                    self.init_browser()  # باز کردن مرورگر جدید با User-Agent جدید
-            
-            logging.info(f"استخراج کامل شد. کل رکوردها: {self.state['saved_records']}")
-        except KeyboardInterrupt:
-            logging.info("توقف دستی توسط کاربر")
-        except Exception as e:
-            logging.error(f"خطای غیرمنتظره: {str(e)}")
-        finally:
-            self.close_browser()
-            logging.info(f"آخرین صفحه پردازش شده: {self.state['current_page'] - 1}")
+    except KeyboardInterrupt:
+        print("\nتوقف دستی توسط کاربر...")
+    except Exception as e:
+        print(f"خطای غیرمنتظره: {str(e)}")
+    finally:
+        driver.quit()
+        print(f"پروسه متوقف شد. آخرین صفحه پردازش شده: {state['current_page'] - 1}")
+        print(f"کل رکوردهای ذخیره شده: {state['saved_records']}")
 
 if __name__ == "__main__":
-    scraper = JobVisionScraper()
-    scraper.run()
+    main()
+    
